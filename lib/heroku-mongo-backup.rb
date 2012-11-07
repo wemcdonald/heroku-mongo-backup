@@ -1,5 +1,6 @@
 # encoding: UTF-8
 
+require 'open-uri'
 require 'mongo'
 require 'json'
 require 'zlib'
@@ -9,7 +10,6 @@ require 'rubygems'
 require 'net/ftp'
 
 module HerokuMongoBackup
-
   if defined?(Rails::Railtie)
     class Railtie < Rails::Railtie
       rake_tasks do
@@ -21,6 +21,17 @@ module HerokuMongoBackup
   require 's3_helpers'
 
   class Backup
+    def env(list, required=true)
+      var = list.map {|v| ENV[v]}.compact.first
+      return var unless var.nil? and required
+
+      if list.length == 1
+        raise "ERROR: Environment variable #{list}"
+      else
+        raise "ERROR: One of these environment variables must be set: #{list}"
+      end
+    end
+
     def chdir
       Dir.chdir("/tmp")
       begin
@@ -55,9 +66,8 @@ module HerokuMongoBackup
     end
 
     def load
-      file = Zlib::GzipReader.open(@file_name)
-      obj = Marshal.load file.read
-      file.close
+      data = Zlib::GzipReader.new(StringIO.new(open(@file_name).read)).read
+      obj = Marshal.load(data)
 
       obj.each do |col_name, records|
         next if col_name =~ /^system\./
@@ -89,9 +99,13 @@ module HerokuMongoBackup
     end
     
     def ftp_connect
-      @ftp = Net::FTP.new(ENV['FTP_HOST'])
+      @ftp = Net::FTP.new(env(['FTP_HOST']))
       @ftp.passive = true
-      @ftp.login(ENV['FTP_USERNAME'], ENV['FTP_PASSWORD'])
+      @ftp.login(env(['FTP_USERNAME']), env(['FTP_PASSWORD']))
+    end
+
+    def ftp_list
+      @ftp.list()
     end
     
     def ftp_upload
@@ -107,38 +121,25 @@ module HerokuMongoBackup
     end
     
     def s3_connect
-      bucket            = ENV['S3_BACKUPS_BUCKET']
-      if bucket.nil?
-        bucket          = ENV['S3_BACKUP_BUCKET']
-      end
-      if bucket.nil?
-        bucket          = ENV['S3_BACKUP']
-      end
-      if bucket.nil?
-        bucket          = ENV['S3_BUCKET']
+      # The first non-nil environment variable of each type will be used
+      env_var_options = {
+        :bucket_name       => %W[S3_BACKUPS_BUCKET S3_BACKUP_BUCKET S3_BACKUP S3_BUCKET],
+        :access_key_id     => %W[S3_KEY_ID S3_KEY S3_ACCESS_KEY AWS_ACCESS_KEY_ID],
+        :secret_access_key => %W[S3_SECRET_KEY S3_SECRET AWS_SECRET_ACCESS_KEY],
+      }
+      args = {}
+
+      env_var_options.each do |type, list|
+        args[type] = env(env_var_options[type])
       end
 
-      access_key_id     = ENV['S3_KEY_ID']
-      if access_key_id.nil?
-        access_key_id   = ENV['S3_KEY']
-      end
-      if access_key_id.nil?
-        access_key_id   = ENV['AWS_ACCESS_KEY_ID']
-      end
-
-      secret_access_key = ENV['S3_SECRET_KEY']
-      if secret_access_key.nil?
-        secret_access_key = ENV['S3_SECRET']
-      end
-      if secret_access_key.nil?
-        secret_access_key = ENV['AWS_SECRET_ACCESS_KEY']
-      end
-
-      @bucket = HerokuMongoBackup::s3_connect(bucket, access_key_id, secret_access_key)
+      @bucket = HerokuMongoBackup::s3_connect(args)
     end
 
     def s3_upload
-      HerokuMongoBackup::s3_upload(@bucket, @file_name)
+      file = HerokuMongoBackup::s3_upload(@bucket, @file_name)
+      puts file.public_url
+      file
     end
 
     def s3_download
@@ -149,22 +150,22 @@ module HerokuMongoBackup
       end
     end
 
+    def http_download(url)
+      require 'open-uri'
+      open(url.split('/').last, 'w') do |file|
+        file << open(url).read
+      end
+    end
+
     def initialize connect = true
       @file_name = Time.now.strftime("%Y-%m-%d_%H-%M-%S.gz")
+      @file_pattern = %r/\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}.gz/
   
-      if( ['production', 'staging'].include?(ENV['RAILS_ENV'] || ENV['RACK_ENV']) )
-
+      environment = env(%W[RAILS_ENV RACK_ENV], false)
+      if ['production', 'staging'].include?(environment)
         #config_template = ERB.new(IO.read("config/mongoid.yml"))
         #uri = YAML.load(config_template.result)['production']['uri']
-        uri = ENV['MONGO_URL']
-
-        if uri.nil?
-          uri = ENV['MONGOHQ_URL']
-        end
-        if uri.nil?
-          uri = ENV['MONGOLAB_URI']
-        end          
-      
+        uri = env(%W[MONGO_URL MONGOHQ_URL MONGOLAB_URI])
       else
         mongoid_config  = YAML.load_file("config/mongoid.yml")
         config = {}
@@ -190,8 +191,6 @@ module HerokuMongoBackup
   
       @url = uri
   
-      puts "Using database: #{@url}"
-  
       self.db_connect
 
       if connect
@@ -201,6 +200,24 @@ module HerokuMongoBackup
           self.s3_connect
         end
       end
+    end
+
+    def most_recent_backup
+      if ENV['UPLOAD_TYPE'] == 'ftp'
+        last = @ftp.list.map {|s| s.split(/\s+/).last}.select {|f| f =~ @file_pattern}.sort.last
+      else
+        files = HerokuMongoBackup::s3_list(@bucket)
+        matching, last = nil, nil
+        files.each do |f|
+          # This depends on the file list enumerator already being sorted, but
+          # allows us to not iterate through every file in S3
+          url = f.public_url.to_s
+          break if matching and url !~ %r{backups/#{@file_pattern}}
+          matching = url =~ %r{backups/#{@file_pattern}}
+          last = url if matching
+        end
+      end
+      puts last
     end
 
     def backup files_number_to_leave=0
@@ -225,10 +242,11 @@ module HerokuMongoBackup
       self.chdir
       
       if download_file
-        if ENV['UPLOAD_TYPE'] == 'ftp'
+        if @file_name =~ /^http/
+        elsif ENV['UPLOAD_TYPE'] == 'ftp'
           self.ftp_download
           @ftp.close
-        else
+        elsif 
           self.s3_download
         end
       end

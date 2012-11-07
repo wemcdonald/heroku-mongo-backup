@@ -10,6 +10,11 @@ namespace :mongo do
       HerokuMongoBackup::Backup.new.backup
     end
   end
+
+  desc "Print the public url of your last backup"
+  task :last_backup => :environment do
+    HerokuMongoBackup::Backup.new.most_recent_backup
+  end
   
   desc "Restore command gets backup file from S3 server or local file and pushes data to production db.\n
         Example of usage: rake mongo:restore FILE=<backup-file.gz>"
