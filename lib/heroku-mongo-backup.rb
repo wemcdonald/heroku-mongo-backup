@@ -26,7 +26,7 @@ module HerokuMongoBackup
       return var unless var.nil? and required
 
       if list.length == 1
-        raise "ERROR: Environment variable #{list}"
+        raise "ERROR: Environment variable #{list.first} must be set"
       else
         raise "ERROR: One of these environment variables must be set: #{list}"
       end
@@ -165,26 +165,19 @@ module HerokuMongoBackup
       if ['production', 'staging'].include?(environment)
         #config_template = ERB.new(IO.read("config/mongoid.yml"))
         #uri = YAML.load(config_template.result)['production']['uri']
-        uri = env(%W[MONGO_URL MONGOHQ_URL MONGOLAB_URI])
+        uri = env(%W[MONGO_URL MONGOLAB_URI MONGOHQ_URL])
       else
         mongoid_config  = YAML.load_file("config/mongoid.yml")
-        config = {}
-        defaults        = mongoid_config['defaults']
-        dev_config      = mongoid_config['development']
-
-        config.merge!(defaults) unless defaults.nil?
-        config.merge!(dev_config)
-
-        host            = config['host']
-        port            = config['port']
-        database        = config['database']
-        uri = "mongodb://#{host}:#{port}/#{database}"
-
-        if uri == 'mongodb://:/' # new mongoid version 3.x
-          mongoid_config  = YAML.load_file("config/mongoid.yml")
-          dev_config      = mongoid_config['development']['sessions']['default']
-          host_port       = dev_config['hosts'].first
-          database        = dev_config['database']
+        if mongoid_config['defaults'].exists? # mongoid version 2.x
+          config = (mongoid_config['defaults']||{}).merge(mongoid_config[environment]||{})
+          host       = config['host']
+          port       = config['port']
+          database   = config['database']
+          uri = "mongodb://#{host}:#{port}/#{database}"
+        else # mongoid version 3.x
+          config     = mongoid_config[environment]['sessions']['default']
+          host_port  = config['hosts'].first
+          database   = config['database']
           uri = "mongodb://#{host_port}/#{database}"
         end
       end
